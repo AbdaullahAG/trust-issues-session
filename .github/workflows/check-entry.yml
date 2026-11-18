@@ -1,0 +1,60 @@
+name: Check entry
+
+# Runs on pull_request (never pull_request_target) with a read-only token.
+# It only READS the proposed files. It never runs code from the pull request.
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Validate the entry
+        env:
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          set -uo pipefail
+          fail=0
+          err() { echo "::error::$1"; echo "- ❌ $1" >> "$GITHUB_STEP_SUMMARY"; fail=1; }
+
+          git init -q work && cd work
+          if ! git fetch -q --depth=2 "https://github.com/${REPO}.git" "refs/pull/${PR}/merge"; then
+            echo "::error::Could not fetch the merged pull request. Does it have conflicts?"; exit 1
+          fi
+          git checkout -q FETCH_HEAD
+
+          status=$(git diff --name-status HEAD^1 HEAD | sed '/^$/d')
+          count=$(printf '%s\n' "$status" | sed '/^$/d' | wc -l)
+          [ "$count" -eq 1 ] || err "Change exactly one file (found $count)."
+
+          if [ "$count" -eq 1 ]; then
+            st=$(printf '%s' "$status" | cut -f1)
+            path=$(printf '%s' "$status" | cut -f2-)
+            [ "$st" = "A" ] || err "The file must be a new file (status: $st)."
+            printf '%s' "$path" | grep -Eq '^entries/[a-z0-9][a-z0-9-]{2,40}\.md$' \
+              || err "The path must look like entries/short-name.md (lowercase letters, digits, hyphens)."
+            mode=$(git ls-tree HEAD -- "$path" | cut -d' ' -f1)
+            [ "$mode" = "100644" ] || err "It must be a regular file (no symlinks, no executables)."
+
+            if [ "$fail" -eq 0 ]; then
+              size=$(wc -c < "$path")
+              [ "$size" -le 4096 ] || err "The file is $size bytes. The limit is 4096."
+              content=$(tr -d '\r' < "$path")
+              printf '%s' "$content" | grep -Eiq 'https?://|www\.|\]\(' && err "No links, please."
+              printf '%s' "$content" | grep -Eq '<[A-Za-z/!]' && err "No HTML, please."
+              for h in "What I learned" "A useful tip" "What I wish the session covered"; do
+                printf '%s\n' "$content" | grep -qx "# $h" || err "Missing the heading: # $h"
+              done
+            fi
+          fi
+
+          if [ "$fail" -eq 0 ]; then
+            echo "- ✅ Entry looks good. A maintainer will review it." >> "$GITHUB_STEP_SUMMARY"
+          fi
+          exit "$fail"
